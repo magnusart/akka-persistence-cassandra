@@ -154,17 +154,57 @@ class CassandraJournal(cfg: Config) extends AsyncWriteJournal with CassandraReco
       }
     }
 
+    def groupBatchSize[T](byteLimit: Int, elements: Seq[T])(extractor: T => Int): Seq[Seq[T]] = {
+      def addAccumulated(accumulated: Seq[Seq[T]], elem: T, newGroup: Boolean): Seq[Seq[T]] =
+        if (newGroup || accumulated.isEmpty) accumulated :+ Seq(elem)
+        else accumulated.dropRight(1) :+ (accumulated.last :+ elem)
+
+      def needsNewGroup(elem: T, byteRemainder: Int) = {
+        val size = extractor(elem)
+        if (size > byteLimit) throw new IllegalArgumentException(s"Element size $size was larger than group batch byte limit $byteLimit.")
+        size > byteRemainder
+      }
+
+      def calcRemainder(elem: T, byteRemainder: Int): Int = {
+        val newRemainder = byteRemainder - extractor(elem)
+        if (newRemainder < 0) byteLimit
+        else newRemainder
+      }
+
+      @annotation.tailrec
+      def batchGroup(
+        byteRemainder: Int,
+        elemRemainder: Seq[T],
+        accumulated:   Seq[Seq[T]]
+      ): Seq[Seq[T]] = {
+        elemRemainder match {
+          case Nil      => accumulated
+          case x :: Nil => addAccumulated(accumulated, x, needsNewGroup(x, byteRemainder))
+          case x :: xs  => batchGroup(calcRemainder(x, byteRemainder), xs, addAccumulated(accumulated, x, needsNewGroup(x, byteRemainder)))
+        }
+      }
+
+      batchGroup(byteLimit, elements, Seq.empty[Seq[T]])
+    }
+
+    def extractSerializedSize(ser: SerializedAtomicWrite): Int =
+      ser.
+        payload.
+        map(_.serialized.remaining).
+        foldLeft(0)(_ + _)
+
     val p = Promise[Done]
     val pid = messages.head.persistenceId
     writeInProgress.put(pid, p.future)
-
     Future(messages.map(serialize)).flatMap { serialized =>
       val result =
         if (messages.size <= config.maxMessageBatchSize) {
           // optimize for the common case
           writeMessages(serialized)
         } else {
-          val groups: List[Seq[SerializedAtomicWrite]] = serialized.grouped(config.maxMessageBatchSize).toList
+          val groupsBySize: List[Seq[SerializedAtomicWrite]] = groupBatchSize(41200, serialized.toList)(extractSerializedSize).toList
+
+          //val groups: List[Seq[SerializedAtomicWrite]] = serialized.grouped(config.maxMessageBatchSize).toList
 
           // execute the groups in sequence
           def rec(todo: List[Seq[SerializedAtomicWrite]], acc: List[Unit]): Future[List[Unit]] =
@@ -172,7 +212,7 @@ class CassandraJournal(cfg: Config) extends AsyncWriteJournal with CassandraReco
               case write :: remainder => writeMessages(write).flatMap(result => rec(remainder, result :: acc))
               case Nil                => Future.successful(acc.reverse)
             }
-          rec(groups, Nil)
+          rec(groupsBySize, Nil)
         }
 
       result.onComplete { _ =>
